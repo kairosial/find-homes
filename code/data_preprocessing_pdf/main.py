@@ -1,17 +1,24 @@
 from pymu import *
 from azure_di import *
+from table_to_text import *
 
-pdf_name = ""
-pdf_path = ""
+pdf_name = "LH-25년1차청년매입임대입주자모집공고문(서울지역본부).pdf"
+pdf_path = rf"data\pdf\{pdf_name}"
 md_file_name = ""
-md_file_path = ""
+md_file_path = rf"data\markdown\{md_file_name}"
+
+final_text_name = ""
+final_text_path = rf"data\text\{final_text_name}"
+
+# [PDF -> Azure DI]
+
 
 
 # [PyMuPDF]
 
 # PDF data 추출
 llama_reader = pymupdf4llm.LlamaMarkdownReader()
-llama_docs = llama_reader.load_data(r"data\pdf_data\LH-25년1차청년매입임대입주자모집공고문(서울지역본부).pdf")
+llama_docs = llama_reader.load_data()
 
 # markdown 파일 읽기
 with open("document_result.md", "r", encoding="utf-8") as file:
@@ -56,3 +63,7 @@ final_md = replace_table_html(restructured_pages, extended_page_list, table_df_l
 # 최종 마크다운 저장
 with open("output.md", "w", encoding="utf-8") as f:
     f.write(final_md)
+
+
+# table -> LLM -> text
+process_file(md_file_path, final_text_path)
