@@ -1,157 +1,97 @@
 from config import *
 
-def azure_md_preprocessing(azure_md):
-    """
-    azure md bullet 및 예외 데이터 전처리, 계층구조 삭제
-    ---
-    params: 애져 마크다운 텍스트
-    ---
-    return: 전처리된 마크다운 텍스트를 페이지별로 나눈 리스트 
-    """
-    # 페이지 분할: 페이지 번호와 내용을 그룹으로 가져오기
-    split_pages = re.split(r'<!--\s*PageNumber="([^"]*)"\s*-->', azure_md)
+def upload_pdf_to_blob(pdf_path: str, blob_name: str) -> str:
+    """PDF를 Blob에 업로드하고 SAS URL 반환"""
+    blob_client = container_client.get_blob_client(blob_name)
+    with open(pdf_path, "rb") as f:
+        blob_client.upload_blob(f, overwrite=True)
 
-    # 불필요한 처음 항목 제거 (페이지 번호 앞 텍스트)
-    if split_pages and not split_pages[0].strip():
-        split_pages = split_pages[1:]
+    sas_token = generate_blob_sas(
+        account_name=blob_service.account_name,
+        container_name=BLOB_CONTAINER_NAME,
+        blob_name=blob_name,
+        account_key=blob_service.credential.account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.utcnow() + timedelta(minutes=15)
+    )
 
-    # 페이지 목록을 (페이지번호, 내용) 튜플로 묶기
-    page_pairs = list(zip(split_pages[::2], split_pages[1::2]))
+    return f"{blob_client.url}?{sas_token}"
 
-    # 전처리 및 페이지 재조합
-    restructured_pages = []
 
-    for page_number, content in page_pairs:
-        lines = content.splitlines()
-        new_lines = []
+def analyze_pdf_to_markdown(sas_url: str) -> str:
+    """Document Intelligence를 사용해 Markdown으로 변환"""
+    poller = di_client.begin_analyze_document(
+        model_id="prebuilt-layout",
+        body=AnalyzeDocumentRequest(url_source=sas_url),
+        output_content_format='markdown'
+    )
+    result = poller.result()
+    return result.content
 
-        for line in lines:
-            if "■" in line:
-                # 동작1: '#' 등 마크다운 계층 구조 제거
-                cleaned_line = re.sub(r'^[#>\-\*\s]+', '', line)
-                # 동작2: ■ 앞에 공백이 있다면 \n■ 처리
-                cleaned_line = re.sub(r'\s*■', r'\n■', cleaned_line)
-                # 동작3: ':'가 있다면 \n: 처리
-                cleaned_line = re.sub(r'\s* :\s*', r'\n:', cleaned_line)
-                # 동작4: ") " → ")\n"
-                cleaned_line = re.sub(r'\)\s+', r')\n', cleaned_line)
-                new_lines.append(cleaned_line)
-            else:
-                new_lines.append(line)
 
-        # 전처리된 페이지 내용 조합
-        modified_content = '\n'.join(new_lines)
-        # page_comment = f'<!-- PageNumber="{page_number.strip()}" -->'
-        restructured_pages.append(f"{page_number.strip()}")
+def request_gpt(prompt: str) -> str:
+    headers = {
+        'Content-Type': 'application/json',
+        'api-key': gpt_api_key
+    }
+    body = {
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    '너는 HTML 테이블을 사람이 이해할 수 있도록 자연어 문장으로 변환해.  '
+                    '항목과 값을 "구분: 내용" 식으로 나누지 말고, 원래 테이블에서 쓰인 항목명을 그대로 key로 사용해.  '
+                    '예: "임대조건 : 내용", "임대보증금-월임대료 전환 : 내용"처럼.  '
+                    '항목이 반복되는 경우에는 구분자를 붙여서 명확하게 구분해줘.  '
+                    '불필요한 요약이나 도입부 없이 표의 핵심 내용만 변환해줘.'
+                )
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "max_tokens": 800
+    }
 
-        return restructured_pages
+    response = requests.post(gpt_endpoint, headers=headers, json=body)
+    if response.status_code == 200:
+        return response.json()['choices'][0]['message']['content']
+    else:
+        print("❌ 요청 실패:", response.status_code, response.text)
+        return "⚠️ 오류가 발생했습니다."
 
-def split_pages(markdown_text):
-    pattern = r'<!-- PageNumber="- (\d+) -" -->\s*<!-- PageBreak -->'
-    parts = re.split(pattern, markdown_text)
-    pages = []
-    for i in range(1, len(parts), 2):
-        page_num = int(parts[i]) + 1
-        content = parts[i+1].strip()
-        pages.append((page_num, content))
-    return pages
 
-def is_table_only(html_text):
-    soup = BeautifulSoup(html_text, 'html.parser')
-    text = soup.get_text().strip()
-    # 태그 중 table 관련 태그만 있는지 확인
-    allowed_tags = {'table', 'tr', 'td', 'th'}
-    all_tags = {tag.name for tag in soup.find_all()}
-    return (text == '') and all_tags.issubset(allowed_tags)
+def convert_md_tables_with_llm_parallel(md_text: str, max_workers=5) -> str:
+    soup = BeautifulSoup(md_text, 'html.parser')
+    tables = soup.find_all('table')
+    table_strs = [str(table) for table in tables]
+    unique_tables = list(set(table_strs))
+    table_to_text = {}
 
-def detect_table_transition(pages):
-    transitions = []
-    page_unit = []
-    for i in range(len(pages) - 1):
-        
-        curr_page_num, curr_content = pages[i]
-        next_page_num, next_content = pages[i + 1]
+    def process_table(table_html):
+        prompt = (
+            f"다음 HTML 테이블의 내용을 자연어 문장으로 간결하게 변환해줘.\n\n{table_html}"
+        )
+        result = request_gpt(prompt)
+        return table_html, result
 
-        if curr_content.strip().endswith('</table>') and next_content.strip().startswith('<table>'): # 현 페이지가 </table>로 끝나고 다음 페이지가 <table>로 시작할 때
-            if curr_page_num in page_unit: # 이미 페이지가 page_unit에 있다면
-                if curr_content.strip().startswith('<table>') and curr_content.strip().endswith('</table>'):
-                    if len(curr_content.split('</table>')) > 2: # 현재 페이지 안에 표가 2개 이상
-                        transitions.append(page_unit) # 현재 페이지까지 저장된 unit 저장
-                        page_unit = []
-                        page_unit.append(curr_page_num) # 현재 페이지부터 다시 카운트
-                        page_unit.append(next_page_num)
-                    else:
-                        page_unit.append(next_page_num) # 한 페이지 전체가 표. 다음 페이지만 저장
-                else:
-                    transitions.append(page_unit)
-                    page_unit = []
-                    page_unit.append(curr_page_num)
-            else:
-                if page_unit:
-                    transitions.append(page_unit)
-                    page_unit = []
-                page_unit.append(curr_page_num)
-                page_unit.append(next_page_num)
-                
-    transitions.append(page_unit)
-    return transitions
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_table, tbl) for tbl in unique_tables]
+        for future in as_completed(futures):
+            tbl_html, gpt_result = future.result()
+            table_to_text[tbl_html] = gpt_result
 
-def merge_transitions(transitions, pages_dict):
-    if not transitions:
-        return []
+    for original_table in table_strs:
+        if original_table in table_to_text:
+            md_text = md_text.replace(original_table, table_to_text[original_table])
 
-    merged = []
-    current_group = transitions[0]
+    return md_text
 
-    for next_pair in transitions[1:]:
-        prev_last = current_group[-1]
-        next_first = next_pair[0]
 
-        if prev_last == next_first:
-            # 중간 페이지가 table-only이면 병합
-            if is_table_only(pages_dict[prev_last]):
-                current_group.append(next_pair[1])
-            else:
-                merged.append(current_group)
-                current_group = next_pair
-        else:
-            merged.append(current_group)
-            current_group = next_pair
-
-    merged.append(current_group)
-    return merged
-
-def process_markdown_for_table_groups(markdown_text):
-    pages = split_pages(markdown_text)
-    pages_dict = dict(pages)
-    transitions = detect_table_transition(pages)
-    merged_groups = merge_transitions(transitions, pages_dict)
-    return merged_groups
-
-def replace_table_html(restructured_pages, extended_page_list, table_df_list):
-    # 전처리 및 페이지 재조합
-    pattern = re.compile(r'<table[\s\S]*?</table>', re.IGNORECASE)
-
-    for i in range(len(extended_page_list)):
-        page_list = extended_page_list[i]
-        df = table_df_list[i]
-        new_html_table = df.to_html(index=False, escape=False)
-
-        # 첫 페이지
-        first_page = page_list[0]
-        page_md = restructured_pages[first_page-1]
-        matches = list(pattern.finditer(page_md))
-        matched_table = matches[-1].group()
-        new_page_md = page_md.replace(matched_table, new_html_table)
-        restructured_pages[first_page-1] = new_page_md
-
-        # 마지막 페이지 + 나머지
-        for i in range(1, len(page_list)):
-            page_md = restructured_pages[page_list[i]-1]
-            matches = list(pattern.finditer(page_md))
-            matched_table = matches[0].group()
-            new_page_md = page_md.replace(matched_table, '')
-            restructured_pages[page_list[i]-1] = new_page_md
-    
-    final_md = '\n'.join(restructured_pages)
-    return final_md
+def preprocess_markdown_headers(md_text: str) -> str:
+    md_text = re.sub(r'^(#{1,6}\s*■?\s*[^:\n]+):\s*(.+)$', r'\1\n\2', md_text, flags=re.MULTILINE)
+    md_text = re.sub(r'^(■\s*\([^)]+\))\s+(.+)$', r'\1\n\2', md_text, flags=re.MULTILINE)
+    return md_text
